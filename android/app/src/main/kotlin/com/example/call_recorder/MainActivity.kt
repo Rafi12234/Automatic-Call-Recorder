@@ -6,6 +6,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.net.Uri
@@ -38,14 +41,39 @@ class MainActivity : FlutterActivity() {
 
     private var pendingPermissionResult: MethodChannel.Result? = null
     private var mediaPlayer: MediaPlayer? = null
+    private lateinit var methodChannel: MethodChannel
+    private var audioManager: AudioManager? = null
+    private var audioFocusRequest: Any? = null
+    private var playbackPaused = false
+
+    private val audioFocusChangeListener =
+        AudioManager.OnAudioFocusChangeListener { change ->
+            if (
+                change == AudioManager.AUDIOFOCUS_LOSS ||
+                change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT
+            ) {
+                try {
+                    if (mediaPlayer?.isPlaying == true) {
+                        mediaPlayer?.pause()
+                        playbackPaused = true
+                    }
+                } catch (_: Exception) {
+                }
+            }
+        }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        MethodChannel(
+        audioManager =
+            getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+        methodChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             CHANNEL
-        ).setMethodCallHandler { call, result ->
+        )
+
+        methodChannel.setMethodCallHandler { call, result ->
 
             when (call.method) {
 
@@ -107,6 +135,14 @@ class MainActivity : FlutterActivity() {
                     }
 
                     playRecording(path, result)
+                }
+
+                "pausePlayback" -> {
+                    result.success(pausePlayback())
+                }
+
+                "resumePlayback" -> {
+                    result.success(resumePlayback())
                 }
 
                 "stopPlayback" -> {
@@ -227,39 +263,187 @@ class MainActivity : FlutterActivity() {
 
             val file = File(path)
 
-            if (!file.exists()) {
+            if (!file.exists() || file.length() == 0L) {
                 result.error(
                     "NOT_FOUND",
-                    "Recording not found",
+                    "Recording file is missing or empty.",
                     null
                 )
                 return
             }
 
             stopPlayback()
+            requestPlaybackAudioFocus()
 
             mediaPlayer = MediaPlayer().apply {
 
-                setDataSource(path)
+                setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
 
+                setDataSource(file.absolutePath)
                 prepare()
-
-                start()
+                setVolume(1.0f, 1.0f)
 
                 setOnCompletionListener {
-                    it.release()
+                    try {
+                        it.release()
+                    } catch (_: Exception) {
+                    }
+
                     mediaPlayer = null
+                    playbackPaused = false
+                    abandonPlaybackAudioFocus()
+
+                    methodChannel.invokeMethod(
+                        "playbackCompleted",
+                        mapOf("path" to path)
+                    )
                 }
+
+                setOnErrorListener { player, what, extra ->
+                    try {
+                        player.release()
+                    } catch (_: Exception) {
+                    }
+
+                    mediaPlayer = null
+                    playbackPaused = false
+                    abandonPlaybackAudioFocus()
+
+                    methodChannel.invokeMethod(
+                        "playbackError",
+                        mapOf(
+                            "path" to path,
+                            "what" to what,
+                            "extra" to extra
+                        )
+                    )
+
+                    true
+                }
+
+                start()
             }
 
+            playbackPaused = false
             result.success(true)
 
         } catch (e: Exception) {
 
+            stopPlayback()
+
             result.error(
                 "PLAY_ERROR",
-                e.message,
+                e.message ?: "Unable to play this recording.",
                 null
+            )
+        }
+    }
+
+
+    private fun pausePlayback(): Boolean {
+
+        return try {
+
+            if (mediaPlayer?.isPlaying == true) {
+                mediaPlayer?.pause()
+                playbackPaused = true
+                true
+            } else {
+                false
+            }
+
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+
+    private fun resumePlayback(): Boolean {
+
+        return try {
+
+            val player = mediaPlayer
+
+            if (player != null && playbackPaused) {
+                requestPlaybackAudioFocus()
+                player.start()
+                playbackPaused = false
+                true
+            } else {
+                false
+            }
+
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+
+    private fun requestPlaybackAudioFocus(): Boolean {
+
+        val manager = audioManager ?: return false
+
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+
+            val request =
+                AudioFocusRequest.Builder(
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+                )
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(
+                                AudioAttributes.CONTENT_TYPE_SPEECH
+                            )
+                            .build()
+                    )
+                    .setOnAudioFocusChangeListener(
+                        audioFocusChangeListener
+                    )
+                    .build()
+
+            audioFocusRequest = request
+
+            manager.requestAudioFocus(request) ==
+                    AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+
+        } else {
+
+            @Suppress("DEPRECATION")
+            manager.requestAudioFocus(
+                audioFocusChangeListener,
+                AudioManager.STREAM_MUSIC,
+                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+            ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        }
+    }
+
+
+    private fun abandonPlaybackAudioFocus() {
+
+        val manager = audioManager ?: return
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+
+            val request =
+                audioFocusRequest as? AudioFocusRequest
+
+            if (request != null) {
+                manager.abandonAudioFocusRequest(request)
+            }
+
+            audioFocusRequest = null
+
+        } else {
+
+            @Suppress("DEPRECATION")
+            manager.abandonAudioFocus(
+                audioFocusChangeListener
             )
         }
     }
@@ -278,6 +462,8 @@ class MainActivity : FlutterActivity() {
         }
 
         mediaPlayer = null
+        playbackPaused = false
+        abandonPlaybackAudioFocus()
     }
 
 
@@ -314,6 +500,37 @@ class CallRecorderService : Service() {
     private var currentFile: File? = null
 
     private var recordingStartedAt: Long = 0
+    private var observedIncomingNumber: String? = null
+    private var lastCallState = TelephonyManager.CALL_STATE_IDLE
+    private var maxObservedAmplitude = 0
+
+    private val amplitudeHandler =
+        Handler(Looper.getMainLooper())
+
+    private val amplitudeSampler =
+        object : Runnable {
+            override fun run() {
+
+                if (!recording) {
+                    return
+                }
+
+                try {
+                    val amplitude =
+                        recorder?.maxAmplitude ?: 0
+
+                    if (amplitude > maxObservedAmplitude) {
+                        maxObservedAmplitude = amplitude
+                    }
+                } catch (_: Exception) {
+                }
+
+                amplitudeHandler.postDelayed(
+                    this,
+                    500
+                )
+            }
+        }
 
 
     // ============================================================
@@ -334,7 +551,10 @@ class CallRecorderService : Service() {
                     phoneNumber
                 )
 
-                handleCallState(state)
+                handleCallState(
+                    state,
+                    phoneNumber
+                )
             }
         }
 
@@ -516,17 +736,27 @@ class CallRecorderService : Service() {
     // ============================================================
 
     private fun handleCallState(
-        state: Int
+        state: Int,
+        phoneNumber: String?
     ) {
+
+        if (state == lastCallState) {
+            return
+        }
+
+        lastCallState = state
 
         when (state) {
 
             TelephonyManager.CALL_STATE_RINGING -> {
 
                 sawRinging = true
+                currentDirection = "Incoming"
 
-                currentDirection =
-                    "Incoming"
+                if (!phoneNumber.isNullOrBlank()) {
+                    observedIncomingNumber =
+                        phoneNumber
+                }
 
                 updateNotification(
                     "Incoming call detected"
@@ -557,6 +787,7 @@ class CallRecorderService : Service() {
                 }
 
                 sawRinging = false
+                observedIncomingNumber = null
 
                 updateNotification(
                     "Ready — waiting for calls"
@@ -656,6 +887,15 @@ class CallRecorderService : Service() {
                 System.currentTimeMillis()
 
             recording = true
+            maxObservedAmplitude = 0
+
+            amplitudeHandler.removeCallbacks(
+                amplitudeSampler
+            )
+
+            amplitudeHandler.post(
+                amplitudeSampler
+            )
 
 
             updateNotification(
@@ -722,6 +962,16 @@ class CallRecorderService : Service() {
         val direction =
             currentDirection
 
+        val incomingNumber =
+            observedIncomingNumber
+
+        amplitudeHandler.removeCallbacks(
+            amplitudeSampler
+        )
+
+        val peakAmplitude =
+            maxObservedAmplitude
+
 
         var validRecording = true
 
@@ -773,7 +1023,9 @@ class CallRecorderService : Service() {
                 file,
                 direction,
                 startedAt,
-                endedAt
+                endedAt,
+                incomingNumber,
+                peakAmplitude
             )
 
         }, 1500)
@@ -788,25 +1040,32 @@ class CallRecorderService : Service() {
         file: File,
         direction: String,
         startedAt: Long,
-        endedAt: Long
+        endedAt: Long,
+        incomingNumber: String?,
+        peakAmplitude: Int
     ) {
 
-        var number = "Unknown"
+        var number =
+            incomingNumber
+                ?.takeIf { it.isNotBlank() }
+                ?: "Unknown"
 
 
-        val call =
-            findLatestMatchingCall(
-                direction,
-                startedAt
-            )
+        if (number == "Unknown") {
 
+            val call =
+                findLatestMatchingCall(
+                    direction,
+                    startedAt
+                )
 
-        if (call != null) {
+            if (call != null) {
 
-            number =
-                call.number.ifBlank {
-                    "Unknown"
-                }
+                number =
+                    call.number.ifBlank {
+                        "Unknown"
+                    }
+            }
         }
 
 
@@ -829,7 +1088,16 @@ class CallRecorderService : Service() {
                         (endedAt - startedAt),
 
                 "path" to
-                        file.absolutePath
+                        file.absolutePath,
+
+                "fileSize" to
+                        file.length(),
+
+                "maxAmplitude" to
+                        peakAmplitude,
+
+                "audioDetected" to
+                        (peakAmplitude > 0)
             )
 
 
@@ -1189,7 +1457,30 @@ object HistoryStore {
                     "path" to
                             item.optString(
                                 "path"
-                            )
+                            ),
+
+                    "fileSize" to
+                            item.optLong(
+                                "fileSize"
+                            ),
+
+                    "maxAmplitude" to
+                            item.optInt(
+                                "maxAmplitude"
+                            ),
+
+                    "audioDetected" to
+                            if (
+                                item.has(
+                                    "audioDetected"
+                                )
+                            ) {
+                                item.optBoolean(
+                                    "audioDetected"
+                                )
+                            } else {
+                                true
+                            }
                 )
             )
         }

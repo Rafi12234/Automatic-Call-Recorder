@@ -38,6 +38,7 @@ class CallRecording {
   final int endedAt;
   final int durationMs;
   final String path;
+  final bool audioDetected;
 
   const CallRecording({
     required this.id,
@@ -47,6 +48,7 @@ class CallRecording {
     required this.endedAt,
     required this.durationMs,
     required this.path,
+    required this.audioDetected,
   });
 
   factory CallRecording.fromMap(Map<dynamic, dynamic> map) {
@@ -58,6 +60,10 @@ class CallRecording {
       endedAt: (map['endedAt'] as num?)?.toInt() ?? 0,
       durationMs: (map['durationMs'] as num?)?.toInt() ?? 0,
       path: map['path']?.toString() ?? '',
+      audioDetected:
+          map.containsKey('audioDetected')
+              ? map['audioDetected'] == true
+              : true,
     );
   }
 }
@@ -82,6 +88,7 @@ class _HomePageState extends State<HomePage>
   Timer? _historyTimer;
 
   String? _playingPath;
+  String? _pausedPath;
 
   late AnimationController _animationController;
   late Animation<double> _pulse;
@@ -105,9 +112,35 @@ class _HomePageState extends State<HomePage>
       ),
     );
 
+    _channel.setMethodCallHandler(
+      _handleNativeEvent,
+    );
+
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _initialize();
     });
+  }
+
+  Future<dynamic> _handleNativeEvent(
+    MethodCall call,
+  ) async {
+    if (
+      call.method == 'playbackCompleted' ||
+      call.method == 'playbackError'
+    ) {
+      if (!mounted) return;
+
+      setState(() {
+        _playingPath = null;
+        _pausedPath = null;
+      });
+
+      if (call.method == 'playbackError') {
+        _showMessage(
+          'Playback failed for this recording.',
+        );
+      }
+    }
   }
 
   Future<void> _initialize() async {
@@ -211,12 +244,30 @@ class _HomePageState extends State<HomePage>
 
     try {
       if (_playingPath == recording.path) {
-        await _channel.invokeMethod('stopPlayback');
+        if (_pausedPath == recording.path) {
+          final resumed =
+              await _channel.invokeMethod<bool>(
+                'resumePlayback',
+              ) ??
+              false;
 
-        if (mounted) {
-          setState(() {
-            _playingPath = null;
-          });
+          if (resumed && mounted) {
+            setState(() {
+              _pausedPath = null;
+            });
+          }
+        } else {
+          final paused =
+              await _channel.invokeMethod<bool>(
+                'pausePlayback',
+              ) ??
+              false;
+
+          if (paused && mounted) {
+            setState(() {
+              _pausedPath = recording.path;
+            });
+          }
         }
 
         return;
@@ -231,22 +282,22 @@ class _HomePageState extends State<HomePage>
 
       setState(() {
         _playingPath = recording.path;
+        _pausedPath = null;
       });
 
-      Future.delayed(
-        Duration(milliseconds: recording.durationMs),
-        () {
-          if (!mounted) return;
-
-          if (_playingPath == recording.path) {
-            setState(() {
-              _playingPath = null;
-            });
-          }
-        },
+      if (!recording.audioDetected) {
+        _showMessage(
+          'The file opened, but Android reported no microphone audio during this call.',
+        );
+      }
+    } on PlatformException catch (e) {
+      _showMessage(
+        e.message ?? 'Could not play recording.',
       );
-    } catch (e) {
-      _showMessage('Could not play recording.');
+    } catch (_) {
+      _showMessage(
+        'Could not play recording.',
+      );
     }
   }
 
@@ -319,6 +370,7 @@ class _HomePageState extends State<HomePage>
     _historyTimer?.cancel();
     _animationController.dispose();
 
+    _channel.setMethodCallHandler(null);
     _channel.invokeMethod('stopPlayback');
 
     super.dispose();
@@ -658,7 +710,12 @@ class _HomePageState extends State<HomePage>
     final incoming =
         recording.type.toLowerCase() == 'incoming';
 
-    final playing = _playingPath == recording.path;
+    final selected =
+        _playingPath == recording.path;
+
+    final playing =
+        selected &&
+        _pausedPath != recording.path;
 
     return Container(
       margin: const EdgeInsets.only(bottom: 11),
@@ -746,11 +803,15 @@ class _HomePageState extends State<HomePage>
                 ),
                 const SizedBox(height: 5),
                 Text(
-                  _fileName(recording.path),
+                  recording.audioDetected
+                      ? _fileName(recording.path)
+                      : 'No microphone audio detected in this file',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: Colors.white24,
+                  style: TextStyle(
+                    color: recording.audioDetected
+                        ? Colors.white24
+                        : Colors.orangeAccent.withOpacity(.75),
                     fontSize: 10.5,
                   ),
                 ),
@@ -777,7 +838,7 @@ class _HomePageState extends State<HomePage>
                   ),
                   child: Icon(
                     playing
-                        ? Icons.stop_rounded
+                        ? Icons.pause_rounded
                         : Icons.play_arrow_rounded,
                   ),
                 ),
